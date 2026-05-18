@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from cannanas_mcp.policy import normalize_source_operations
+
+REPORTING_CURRENCY = "EUR"
+DEFAULT_QUANTITY_UNIT = "g"
 
 PERSON_ENTITY_KEYS = {
     "member", "members", "user", "users", "customer", "customers", "patient", "patients",
@@ -19,16 +23,32 @@ SENSITIVE_KEY_FRAGMENTS = {
 PERSON_NAME_KEYS = {"name", "first_name", "firstname", "last_name", "lastname", "full_name", "fullname"}
 SAFE_NAME_CONTEXTS = {"product", "products", "strain", "strains", "category", "categories", "club", "clubs", "inventory"}
 
+# Money fields are intentionally restricted to financial contexts. In Cannanas payloads, bare
+# "amount" often means cannabis quantity/grams, not currency.
 MONEY_FIELD_PRIORITY = (
     "paid_amount", "amount_paid", "paidAmount", "amountPaid", "gross_total", "grossTotal",
     "net_total", "netTotal", "total_amount", "totalAmount", "total_price", "totalPrice",
     "grand_total", "grandTotal", "final_total", "finalTotal", "cart_total", "cartTotal",
-    "checkout_total", "checkoutTotal", "summary.total", "summary.amount", "summary.gross_total",
-    "summary.net_total", "amounts.total", "amounts.gross", "amounts.net", "payment.amount",
-    "payment.total", "price_total", "priceTotal", "total", "amount", "price",
+    "checkout_total", "checkoutTotal", "revenue", "sales", "summary.total", "summary.amount",
+    "summary.gross_total", "summary.net_total", "amounts.total", "amounts.gross", "amounts.net",
+    "payment.amount", "payment.total", "price_total", "priceTotal", "total", "price",
 )
-LINE_ITEM_MONEY_FIELDS = (
-    "line_total", "lineTotal", "total", "total_price", "totalPrice", "amount", "price", "unit_price", "unitPrice",
+LINE_ITEM_TOTAL_FIELDS = (
+    "line_total", "lineTotal", "total", "total_price", "totalPrice", "price_total", "priceTotal",
+    "gross_total", "grossTotal", "net_total", "netTotal",
+)
+UNIT_PRICE_FIELDS = (
+    "unit_price", "unitPrice", "price_per_unit", "pricePerUnit", "gram_price", "gramPrice", "price",
+)
+QUANTITY_FIELD_PRIORITY = (
+    "fulfilled_quantity", "fulfilledQuantity", "dispensed_quantity", "dispensedQuantity",
+    "fulfilled_amount", "fulfilledAmount", "dispensed_amount", "dispensedAmount",
+    "amount_in_grams", "amountInGrams", "weight_in_grams", "weightInGrams",
+    "grams", "gram", "quantity_grams", "quantityGrams", "quantity_in_grams", "quantityInGrams",
+    "selected_amount", "selectedAmount", "actual_amount", "actualAmount", "quantity", "amount", "weight",
+)
+UNIT_FIELD_PRIORITY = (
+    "unit", "quantity_unit", "quantityUnit", "weight_unit", "weightUnit", "amount_unit", "amountUnit",
 )
 
 
@@ -64,13 +84,17 @@ def build_revenue_summary(charges: list[dict[str, Any]], *, period_start: str, p
         by_status[status]["count"] += 1
         by_payment_method[payment_method]["count"] += 1
 
-    notes = ["Revenue totals are derived heuristically from Cannanas payloads and should be validated against finance exports for accounting use."]
+    notes = [
+        "Money values are reported as EUR. The parser does not treat bare 'amount' as money because Cannanas often uses it for cannabis quantity.",
+        "Revenue totals are derived heuristically from Cannanas payloads and should be validated against finance exports for accounting use.",
+    ]
     if charges and extracted_amounts == 0:
-        notes.append("Records were found, but no supported money field was extractable. Run diagnose_reporting_sources and inspect candidate_money_fields.")
+        notes.append("Records were found, but no supported money field was extractable. Run diagnose_reporting_sources and inspect candidate_money_fields and extractable_money_sources.")
 
     return {
         "period_start": period_start,
         "period_end": period_end,
+        "currency": REPORTING_CURRENCY,
         "totals": {
             "charge_count": len(charges),
             "amount_total": round(total_amount, 2),
@@ -91,28 +115,47 @@ def build_revenue_summary(charges: list[dict[str, Any]], *, period_start: str, p
 def build_dispensed_amounts(carts: list[dict[str, Any]], *, period_start: str, period_end: str) -> dict[str, Any]:
     totals_by_unit: dict[str, float] = defaultdict(float)
     totals_by_status: dict[str, int] = defaultdict(int)
+    totals_by_quantity_source: dict[str, int] = defaultdict(int)
     strain_totals: dict[str, dict[str, Any]] = defaultdict(lambda: {"quantity_total": 0.0, "item_count": 0})
     item_count = 0
+    items_with_quantity = 0
+
     for cart in carts:
         status = str(_pick_value(cart, ["status"]) or "unknown").lower()
         totals_by_status[status] += 1
         for item in _extract_cart_items(cart):
-            quantity = _extract_quantity(item)
-            unit = str(_pick_value(item, ["unit", "quantity_unit", "weight_unit"]) or "units").lower()
+            quantity, source = _extract_quantity_with_source(item)
+            unit = _extract_quantity_unit(item, source)
             strain_name = str(_pick_value(item, ["strain_name", "strain.name", "product.strain_name", "product.strain.name", "inventory_item.strain.name"]) or "unknown")
             item_count += 1
             if quantity is None:
                 continue
+            items_with_quantity += 1
+            totals_by_quantity_source[source or "unknown"] += 1
             totals_by_unit[unit] += quantity
             strain_totals[strain_name]["quantity_total"] += quantity
             strain_totals[strain_name]["item_count"] += 1
+
+    notes = ["Dispensed quantities are aggregated from fulfilled cart item quantities. Mixed units are kept separate rather than converted."]
+    if item_count and items_with_quantity == 0:
+        notes.append("Cart items were found, but no supported cannabis quantity field was extractable. Run diagnose_reporting_sources and inspect candidate_quantity_fields.")
+
     return {
         "period_start": period_start,
         "period_end": period_end,
-        "totals": {"cart_count": len(carts), "cart_item_count": item_count, "total_by_unit": {unit: round(amount, 3) for unit, amount in sorted(totals_by_unit.items())}},
+        "totals": {
+            "cart_count": len(carts),
+            "cart_item_count": item_count,
+            "cart_items_with_extractable_quantity": items_with_quantity,
+            "total_by_unit": {unit: round(amount, 3) for unit, amount in sorted(totals_by_unit.items())},
+        },
         "comparisons": {},
-        "breakdowns": {"cart_status_counts": [{"key": key, "count": totals_by_status[key]} for key in sorted(totals_by_status)], "top_strains": _collapse_named_totals(strain_totals)},
-        "notes": ["Dispensed quantities are aggregated from fulfilled cart item quantities. Mixed units are kept separate rather than converted."],
+        "breakdowns": {
+            "cart_status_counts": [{"key": key, "count": totals_by_status[key]} for key in sorted(totals_by_status)],
+            "by_quantity_source": [{"key": key, "count": value} for key, value in sorted(totals_by_quantity_source.items())],
+            "top_strains": _collapse_named_totals(strain_totals),
+        },
+        "notes": notes,
         "source_operations": normalize_source_operations(["getClubCarts"]),
     }
 
@@ -124,13 +167,13 @@ def build_strain_performance(carts: list[dict[str, Any]], products: list[dict[st
     for cart in carts:
         seen_strains_for_cart: set[str] = set()
         for item in _extract_cart_items(cart):
-            product_id = _pick_value(item, ["product_id", "product.id", "inventory_item.product_id"])
-            explicit_name = _pick_value(item, ["strain_name", "strain.name", "product.strain_name", "product.strain.name", "inventory_item.strain.name"])
-            explicit_id = _pick_value(item, ["strain_id", "strain.id", "product.strain_id", "product.strain.id"])
+            product_id = _pick_value(item, ["product_id", "productId", "product.id", "inventory_item.product_id"])
+            explicit_name = _pick_value(item, ["strain_name", "strainName", "strain.name", "product.strain_name", "product.strain.name", "inventory_item.strain.name"])
+            explicit_id = _pick_value(item, ["strain_id", "strainId", "strain.id", "product.strain_id", "product.strain.id"])
             lookup_name, lookup_unit = _lookup_strain_context(product_lookup, strain_lookup, product_id, explicit_id)
             strain_name = str(explicit_name or lookup_name or "unknown")
-            quantity = _extract_quantity(item)
-            unit = str(_pick_value(item, ["unit", "quantity_unit", "weight_unit"]) or lookup_unit or "units").lower()
+            quantity, source = _extract_quantity_with_source(item)
+            unit = _extract_quantity_unit(item, source) or lookup_unit or DEFAULT_QUANTITY_UNIT
             if quantity is not None:
                 totals[strain_name]["quantity_total"] += quantity
             totals[strain_name]["unit"] = unit
@@ -146,12 +189,12 @@ def build_category_breakdown(carts: list[dict[str, Any]], products: list[dict[st
     category_totals: dict[str, dict[str, Any]] = defaultdict(lambda: {"quantity_total": 0.0, "item_count": 0})
     for cart in carts:
         for item in _extract_cart_items(cart):
-            product_id = _pick_value(item, ["product_id", "product.id", "inventory_item.product_id"])
+            product_id = _pick_value(item, ["product_id", "productId", "product.id", "inventory_item.product_id"])
             category = _pick_value(item, ["category", "type", "kind", "product.type", "product.category"])
             if category is None and product_id is not None and str(product_id) in product_lookup:
                 category = product_lookup[str(product_id)]["category"]
             category_name = str(category or "unknown")
-            quantity = _extract_quantity(item)
+            quantity, _source = _extract_quantity_with_source(item)
             if quantity is not None:
                 category_totals[category_name]["quantity_total"] += quantity
             category_totals[category_name]["item_count"] += 1
@@ -163,10 +206,11 @@ def build_weekly_metrics(*, period_start: str, period_end: str, revenue_summary:
     return {
         "period_start": period_start,
         "period_end": period_end,
+        "currency": REPORTING_CURRENCY,
         "totals": {"charge_count": revenue_summary["totals"]["charge_count"], "revenue_amount_total": revenue_summary["totals"]["amount_total"], "fulfilled_cart_count": dispensed_amounts["totals"]["cart_count"], "journal_entry_count": len(member_journals), "member_statistics": member_stats_summary},
         "comparisons": {},
         "breakdowns": {"revenue_by_status": revenue_summary["breakdowns"]["by_status"], "dispensed_by_unit": [{"key": key, "quantity_total": value} for key, value in dispensed_amounts["totals"]["total_by_unit"].items()], "top_strains": strain_performance["breakdowns"]["by_strain"][:10], "category_breakdown": category_breakdown["breakdowns"]["by_category"]},
-        "notes": ["Weekly metrics combine revenue, fulfilled carts, member activity, and enrichment from products/strains where available.", *revenue_summary["notes"], *dispensed_amounts["notes"]],
+        "notes": ["Money values are reported as EUR.", "Weekly metrics combine revenue, fulfilled carts, member activity, and enrichment from products/strains where available.", *revenue_summary["notes"], *dispensed_amounts["notes"]],
         "source_operations": normalize_source_operations([*revenue_summary["source_operations"], *dispensed_amounts["source_operations"], *strain_performance["source_operations"], *category_breakdown["source_operations"], "getMemberstatistics", "getClubMemberJournals"]),
     }
 
@@ -184,12 +228,14 @@ def build_reporting_source_diagnostics(*, period_start: str, period_end: str, so
     if charges.get("item_count") == 0 and carts.get("item_count", 0) > 0:
         recommendations.append("Club charges are empty while carts exist. Revenue should probably be derived from fulfilled carts, ledger/TSE transactions, or another finance endpoint rather than getClubCharges.")
     if charges.get("item_count", 0) > 0 and charges.get("items_with_extractable_money", 0) == 0:
-        recommendations.append("Club charges exist but no amount is extractable with current parsers. Use candidate_money_fields to add the correct amount path.")
+        recommendations.append("Club charges exist but no money value is extractable with current parsers. Use candidate_money_fields to add the correct amount path.")
+    if carts.get("item_count", 0) > 0 and carts.get("items_with_extractable_quantity", 0) == 0:
+        recommendations.append("Carts exist but no cannabis quantity is extractable. Inspect candidate_quantity_fields and extractable_quantity_sources.")
     if carts.get("item_count") == 0:
         recommendations.append("No carts were found for the selected period. Verify club_id, date field semantics, and date range.")
     if not recommendations:
-        recommendations.append("Use the source with non-zero records and extractable money fields as the first candidate for sales reporting.")
-    return {"period_start": period_start, "period_end": period_end, "sources": diagnostics, "recommendations": recommendations, "privacy": {"raw_records_returned": False, "sample_values_redacted": True}, "source_operations": normalize_source_operations(source_results.keys())}
+        recommendations.append("Use the source with non-zero records and extractable money/quantity fields as the first candidate for sales reporting.")
+    return {"period_start": period_start, "period_end": period_end, "currency": REPORTING_CURRENCY, "sources": diagnostics, "recommendations": recommendations, "privacy": {"raw_records_returned": False, "sample_values_redacted": True}, "source_operations": normalize_source_operations(source_results.keys())}
 
 
 def build_data_quality_report(*, period_start: str, period_end: str, diagnostics: dict[str, Any]) -> dict[str, Any]:
@@ -207,13 +253,13 @@ def build_data_quality_report(*, period_start: str, period_end: str, diagnostics
         issues.append({"severity": "high", "source": "getClubCharges/getClubCarts", "issue": "revenue_source_mismatch", "detail": "Charges are empty but carts exist, so charge-based revenue can report zero incorrectly."})
     if charges.get("item_count", 0) > 0 and charges.get("items_with_extractable_money", 0) == 0:
         issues.append({"severity": "high", "source": "getClubCharges", "issue": "charge_money_not_extractable", "detail": "Charges exist but the current parser cannot find a monetary total field."})
-    if carts.get("item_count", 0) > 0 and carts.get("items_with_extractable_money", 0) == 0:
-        issues.append({"severity": "medium", "source": "getClubCarts", "issue": "cart_money_not_extractable", "detail": "Carts exist but no common money fields were detected in sampled records."})
+    if carts.get("item_count", 0) > 0 and carts.get("items_with_extractable_quantity", 0) == 0:
+        issues.append({"severity": "high", "source": "getClubCarts", "issue": "cart_quantity_not_extractable", "detail": "Carts exist but no cannabis quantity fields were extractable."})
     if products.get("item_count") == 0:
         issues.append({"severity": "medium", "source": "getClubProducts", "issue": "empty_product_catalog"})
     if strains.get("item_count") == 0:
         issues.append({"severity": "low", "source": "getClubStrains", "issue": "empty_strain_catalog"})
-    return {"period_start": period_start, "period_end": period_end, "issue_count": len(issues), "issues": issues, "notes": ["This report is based on metadata, counts, and safe field-shape diagnostics rather than raw personal records."], "source_operations": diagnostics.get("source_operations", [])}
+    return {"period_start": period_start, "period_end": period_end, "currency": diagnostics.get("currency", REPORTING_CURRENCY), "issue_count": len(issues), "issues": issues, "notes": ["This report is based on metadata, counts, and safe field-shape diagnostics rather than raw personal records."], "source_operations": diagnostics.get("source_operations", [])}
 
 
 def summarize_items_for_diagnostics(operation_id: str, items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -223,7 +269,9 @@ def summarize_items_for_diagnostics(operation_id: str, items: list[dict[str, Any
     money_fields: dict[str, int] = defaultdict(int)
     quantity_fields: dict[str, int] = defaultdict(int)
     items_with_extractable_money = 0
+    items_with_extractable_quantity = 0
     extractable_money_sources: dict[str, int] = defaultdict(int)
+    extractable_quantity_sources: dict[str, int] = defaultdict(int)
     items_with_items_list = 0
     for item in items[:200]:
         flattened = _flatten_shape(item)
@@ -234,19 +282,27 @@ def summarize_items_for_diagnostics(operation_id: str, items: list[dict[str, Any
                 date_fields.add(key)
             if key_l.endswith("status") or key_l == "status":
                 status_counts[str(value)] += 1
-            if any(fragment in key_l for fragment in ("amount", "total", "price", "gross", "net", "paid", "fee", "sum")):
-                if _coerce_float(value) is not None:
-                    money_fields[key] += 1
-            if any(fragment in key_l for fragment in ("quantity", "weight", "gram", "amount")):
-                if _coerce_float(value) is not None:
-                    quantity_fields[key] += 1
+            if _looks_like_money_key(key_l) and _coerce_float(value) is not None:
+                money_fields[key] += 1
+            if _looks_like_quantity_key(key_l) and _coerce_float(value) is not None:
+                quantity_fields[key] += 1
         amount, source = _extract_money_amount_with_source(item)
         if amount is not None:
             items_with_extractable_money += 1
             extractable_money_sources[source or "unknown"] += 1
         if _extract_cart_items(item):
             items_with_items_list += 1
-    return {"ok": True, "operation_id": operation_id, "item_count": len(items), "sampled_count": min(len(items), 200), "date_fields_seen": sorted(date_fields), "status_counts": dict(sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))[:20]), "candidate_money_fields": dict(sorted(money_fields.items(), key=lambda item: (-item[1], item[0]))[:40]), "candidate_quantity_fields": dict(sorted(quantity_fields.items(), key=lambda item: (-item[1], item[0]))[:20]), "items_with_extractable_money": items_with_extractable_money, "extractable_money_sources": dict(sorted(extractable_money_sources.items())), "items_with_items_list": items_with_items_list, "top_level_fields": sorted({key.split(".")[0] for key in field_counts})[:80]}
+            for cart_item in _extract_cart_items(item):
+                quantity, q_source = _extract_quantity_with_source(cart_item)
+                if quantity is not None:
+                    items_with_extractable_quantity += 1
+                    extractable_quantity_sources[q_source or "unknown"] += 1
+        else:
+            quantity, q_source = _extract_quantity_with_source(item)
+            if quantity is not None:
+                items_with_extractable_quantity += 1
+                extractable_quantity_sources[q_source or "unknown"] += 1
+    return {"ok": True, "operation_id": operation_id, "item_count": len(items), "sampled_count": min(len(items), 200), "date_fields_seen": sorted(date_fields), "status_counts": dict(sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))[:20]), "candidate_money_fields": dict(sorted(money_fields.items(), key=lambda item: (-item[1], item[0]))[:40]), "candidate_quantity_fields": dict(sorted(quantity_fields.items(), key=lambda item: (-item[1], item[0]))[:40]), "items_with_extractable_money": items_with_extractable_money, "extractable_money_sources": dict(sorted(extractable_money_sources.items())), "items_with_extractable_quantity": items_with_extractable_quantity, "extractable_quantity_sources": dict(sorted(extractable_quantity_sources.items())), "items_with_items_list": items_with_items_list, "top_level_fields": sorted({key.split(".")[0] for key in field_counts})[:80]}
 
 
 def sanitize_for_privacy(data: Any, *, context: tuple[str, ...] = ()) -> Any:
@@ -303,7 +359,7 @@ def _extract_money_amount_with_source(record: dict[str, Any]) -> tuple[float | N
     candidates: list[tuple[str, float]] = []
     for key, value in flattened.items():
         key_l = key.lower()
-        if any(fragment in key_l for fragment in ("total", "amount", "gross", "net", "paid")) and not any(fragment in key_l for fragment in ("quantity", "weight", "gram")):
+        if _looks_like_money_key(key_l):
             number = _coerce_float(value)
             if number is not None:
                 candidates.append((key, number))
@@ -320,11 +376,11 @@ def _sum_line_items(record: dict[str, Any]) -> float | None:
     total = 0.0
     found = False
     for item in items:
-        direct_amount = _pick_first_number(item, LINE_ITEM_MONEY_FIELDS)
-        quantity = _extract_quantity(item)
-        unit_price = _pick_first_number(item, ("unit_price", "unitPrice", "price", "amount"))
-        if direct_amount is not None and ("unit_price" not in item and "unitPrice" not in item):
-            total += direct_amount
+        direct_total = _pick_first_number(item, LINE_ITEM_TOTAL_FIELDS)
+        quantity, _source = _extract_quantity_with_source(item)
+        unit_price = _pick_first_number(item, UNIT_PRICE_FIELDS)
+        if direct_total is not None:
+            total += direct_total
             found = True
         elif quantity is not None and unit_price is not None:
             total += quantity * unit_price
@@ -332,15 +388,68 @@ def _sum_line_items(record: dict[str, Any]) -> float | None:
     return total if found else None
 
 
+def _extract_quantity(item: dict[str, Any]) -> float | None:
+    quantity, _source = _extract_quantity_with_source(item)
+    return quantity
+
+
+def _extract_quantity_with_source(item: dict[str, Any]) -> tuple[float | None, str | None]:
+    for path in QUANTITY_FIELD_PRIORITY:
+        number = _coerce_float(_pick_value(item, [path]))
+        if number is not None:
+            return number, path
+    flattened = _flatten_shape(item)
+    candidates: list[tuple[str, float]] = []
+    for key, value in flattened.items():
+        key_l = key.lower()
+        if _looks_like_quantity_key(key_l):
+            number = _coerce_float(value)
+            if number is not None:
+                candidates.append((key, number))
+    if candidates:
+        candidates.sort(key=lambda item: (_quantity_key_rank(item[0]), item[0]))
+        return candidates[0][1], candidates[0][0]
+    return None, None
+
+
+def _extract_quantity_unit(item: dict[str, Any], quantity_source: str | None = None) -> str:
+    unit = _pick_value(item, list(UNIT_FIELD_PRIORITY))
+    if unit:
+        return str(unit).lower()
+    if quantity_source and any(token in quantity_source.lower() for token in ("gram", "grams", "weight")):
+        return "g"
+    return DEFAULT_QUANTITY_UNIT
+
+
+def _looks_like_money_key(key_l: str) -> bool:
+    if any(fragment in key_l for fragment in ("quantity", "weight", "gram", "grams", "cannabis")):
+        return False
+    if key_l.endswith("amount") and not any(fragment in key_l for fragment in ("paid", "payment", "price", "total", "gross", "net", "revenue", "sales")):
+        return False
+    return any(fragment in key_l for fragment in ("total", "price", "gross", "net", "paid", "payment", "revenue", "sales"))
+
+
+def _looks_like_quantity_key(key_l: str) -> bool:
+    return any(fragment in key_l for fragment in ("quantity", "weight", "gram", "grams", "dispensed", "fulfilled", "cannabisamount", "amountingrams")) or key_l.endswith("amount")
+
+
 def _money_key_rank(key: str) -> int:
     key_l = key.lower()
     rank = 100
-    for idx, token in enumerate(("paid", "gross", "net", "total", "amount", "price")):
+    for idx, token in enumerate(("paid", "payment", "gross", "net", "revenue", "sales", "total", "price")):
         if token in key_l:
             rank = min(rank, idx)
     if any(token in key_l for token in ("tax", "vat", "fee", "discount")):
         rank += 20
     return rank
+
+
+def _quantity_key_rank(key: str) -> int:
+    key_l = key.lower()
+    for idx, token in enumerate(("fulfilled", "dispensed", "gram", "weight", "quantity", "amount")):
+        if token in key_l:
+            return idx
+    return 100
 
 
 def _pick_first_number(data: dict[str, Any], paths: tuple[str, ...]) -> float | None:
@@ -351,28 +460,20 @@ def _pick_first_number(data: dict[str, Any], paths: tuple[str, ...]) -> float | 
     return None
 
 
-def _extract_quantity(item: dict[str, Any]) -> float | None:
-    for path in ("fulfilled_quantity", "fulfilledQuantity", "dispensed_quantity", "dispensedQuantity", "quantity", "amount", "weight"):
-        number = _coerce_float(_pick_value(item, [path]))
-        if number is not None:
-            return number
-    return None
-
-
 def _build_product_lookup(products: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for product in products:
-        product_id = _pick_value(product, ["id", "product_id"])
+        product_id = _pick_value(product, ["id", "product_id", "productId"])
         if product_id is None:
             continue
-        lookup[str(product_id)] = {"category": _pick_value(product, ["category", "type", "kind"]), "strain_name": _pick_value(product, ["strain_name", "strain.name"]), "strain_id": _pick_value(product, ["strain_id", "strain.id"]), "unit": _pick_value(product, ["unit", "quantity_unit"])}
+        lookup[str(product_id)] = {"category": _pick_value(product, ["category", "type", "kind"]), "strain_name": _pick_value(product, ["strain_name", "strainName", "strain.name"]), "strain_id": _pick_value(product, ["strain_id", "strainId", "strain.id"]), "unit": _pick_value(product, ["unit", "quantity_unit", "quantityUnit"])}
     return lookup
 
 
 def _build_strain_lookup(strains: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for strain in strains:
-        strain_id = _pick_value(strain, ["id", "strain_id"])
+        strain_id = _pick_value(strain, ["id", "strain_id", "strainId"])
         if strain_id is not None:
             lookup[str(strain_id)] = {"name": _pick_value(strain, ["name", "title"])}
     return lookup
@@ -390,19 +491,19 @@ def _lookup_strain_context(product_lookup: dict[str, dict[str, Any]], strain_loo
 
 
 def _extract_cart_items(cart: dict[str, Any]) -> list[dict[str, Any]]:
-    for key in ("items", "cart_items", "cartItems", "line_items", "lineItems", "positions", "products"):
+    for key in ("items", "cart_items", "cartItems", "line_items", "lineItems", "positions", "products", "cartProducts", "clubCartItems"):
         items = cart.get(key)
         if isinstance(items, list):
             return [item for item in items if isinstance(item, dict)]
     for value in cart.values():
         if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
             sample = value[0]
-            if any(key in sample for key in ("quantity", "fulfilled_quantity", "fulfilledQuantity", "product_id", "productId", "strain_id", "strainId", "price", "amount", "total")):
+            if any(key in sample for key in ("quantity", "fulfilled_quantity", "fulfilledQuantity", "dispensedAmount", "amountInGrams", "product_id", "productId", "strain_id", "strainId", "price", "total")):
                 return value
     return []
 
 
-def _pick_value(data: Any, paths: list[str]) -> Any:
+def _pick_value(data: Any, paths: list[str] | tuple[str, ...]) -> Any:
     for path in paths:
         value = _get_path_value(data, path)
         if value is not None:
@@ -436,11 +537,23 @@ def _recursive_find(data: Any, candidate_keys: set[str]) -> Any:
 
 
 def _coerce_float(value: Any) -> float | None:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, dict):
+        return _coerce_float(_pick_value(value, ["value", "amount", "quantity", "grams", "total", "price"]))
     if isinstance(value, str):
-        cleaned = value.strip().replace("€", "").replace(" ", "")
-        if "," in cleaned and "." not in cleaned:
+        match = re.search(r"[-+]?\d[\d\s.,]*", value.replace("\u00a0", " "))
+        if not match:
+            return None
+        cleaned = match.group(0).replace(" ", "")
+        if "," in cleaned and "." in cleaned:
+            if cleaned.rfind(",") > cleaned.rfind("."):
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
+        elif "," in cleaned:
             cleaned = cleaned.replace(",", ".")
         try:
             return float(cleaned)
@@ -450,7 +563,7 @@ def _coerce_float(value: Any) -> float | None:
 
 
 def _to_sorted_breakdown(values: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{"key": key, "count": value["count"], "amount_total": round(value["amount_total"], 2)} for key, value in sorted(values.items(), key=lambda item: (-item[1]["amount_total"], item[0]))]
+    return [{"key": key, "count": value["count"], "amount_total": round(value["amount_total"], 2), "currency": REPORTING_CURRENCY} for key, value in sorted(values.items(), key=lambda item: (-item[1]["amount_total"], item[0]))]
 
 
 def _collapse_named_totals(values: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
