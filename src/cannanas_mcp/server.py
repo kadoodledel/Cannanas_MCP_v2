@@ -12,11 +12,14 @@ from cannanas_mcp.openapi_index import OperationIndex
 from cannanas_mcp.policy import is_operation_allowed
 from cannanas_mcp.reporting import (
     build_category_breakdown,
+    build_data_quality_report,
     build_dispensed_amounts,
+    build_reporting_source_diagnostics,
     build_revenue_summary,
     build_strain_performance,
     build_weekly_metrics,
     resolve_period_window,
+    sanitize_for_privacy,
     summarize_member_statistics,
 )
 
@@ -54,6 +57,10 @@ def _tool_disabled_error(tool_name: str) -> dict[str, Any]:
     }
 
 
+def _sanitize_response(response: dict[str, Any]) -> dict[str, Any]:
+    return sanitize_for_privacy(response)
+
+
 async def _call_paginated(
     *,
     settings: Settings,
@@ -63,6 +70,7 @@ async def _call_paginated(
     reason: str,
     page_size: int | None = None,
     max_records: int | None = None,
+    sanitize: bool = True,
 ) -> dict[str, Any]:
     operation = get_index().get(operation_id)
     allowed, error = is_operation_allowed(settings, operation)
@@ -77,7 +85,7 @@ async def _call_paginated(
     client = _make_client(settings)
     logger.info("Calling Cannanas paginated operation %s", operation_id)
     if operation.supports_pagination:
-        return await client.call_paginated_operation(
+        result = await client.call_paginated_operation(
             operation=operation,
             rendered_path=rendered_path,
             query_params=query_params,
@@ -85,6 +93,7 @@ async def _call_paginated(
             page_size=page_size,
             max_records=max_records,
         )
+        return _sanitize_response(result) if sanitize else result
 
     result = await client.call_operation(
         operation=operation,
@@ -93,9 +102,9 @@ async def _call_paginated(
         reason=reason,
     )
     if not result.get("ok"):
-        return result
+        return _sanitize_response(result) if sanitize else result
     items = client.extract_list_items(result.get("data"))
-    return {
+    response = {
         "ok": True,
         "status_code": result.get("status_code"),
         "operation_id": operation_id,
@@ -111,6 +120,7 @@ async def _call_paginated(
             "truncated": False,
         },
     }
+    return _sanitize_response(response) if sanitize else response
 
 
 async def _call_raw(
@@ -121,6 +131,7 @@ async def _call_raw(
     query_params: dict[str, Any] | None,
     body: dict[str, Any] | list[Any] | None,
     reason: str,
+    sanitize: bool = True,
 ) -> dict[str, Any]:
     operation = get_index().get(operation_id)
     allowed, error = is_operation_allowed(settings, operation)
@@ -133,13 +144,14 @@ async def _call_raw(
 
     rendered_path = get_index().render_path(operation, path_params)
     logger.info("Calling Cannanas operation %s", operation_id)
-    return await _make_client(settings).call_operation(
+    result = await _make_client(settings).call_operation(
         operation=operation,
         rendered_path=rendered_path,
         query_params=query_params,
         body=body,
         reason=reason,
     )
+    return _sanitize_response(result) if sanitize else result
 
 
 @mcp.resource("cannanas://info")
@@ -160,12 +172,18 @@ def server_info() -> dict[str, Any]:
             "describe_operation",
             "auth_test",
             "call_operation",
+            "diagnose_reporting_sources",
+            "get_data_quality_report",
             "get_weekly_metrics",
             "get_revenue_summary",
             "get_dispensed_amounts",
             "get_strain_performance",
             "get_category_breakdown",
         ],
+        "privacy": {
+            "raw_call_operation_responses_sanitized": True,
+            "diagnostic_tools_return_raw_records": False,
+        },
     }
 
 
@@ -217,11 +235,12 @@ async def auth_test() -> dict[str, Any]:
 
     operation = get_index().get("testAuth")
     rendered_path = get_index().render_path(operation, {})
-    return await _make_client(settings).call_operation(
+    result = await _make_client(settings).call_operation(
         operation=operation,
         rendered_path=rendered_path,
         reason="Validate the configured Cannanas API key.",
     )
+    return _sanitize_response(result)
 
 
 @mcp.tool
@@ -233,7 +252,7 @@ async def call_operation(
     dry_run: bool = False,
     reason: str | None = None,
 ) -> dict[str, Any]:
-    """Call a supported Cannanas API operation by operation_id."""
+    """Call a supported Cannanas API operation by operation_id. Responses are privacy-sanitized."""
     settings = get_settings()
     if not settings.api_key:
         return _missing_api_key_error()
@@ -256,23 +275,116 @@ async def call_operation(
 
     rendered_path = get_index().render_path(operation, path_params)
     if dry_run:
-        return {
-            "ok": True,
-            "dry_run": True,
-            "operation": operation.to_summary(),
-            "rendered_path": rendered_path,
-            "query_params": query_params,
-            "body": body,
-            "reason": reason,
-        }
+        return _sanitize_response(
+            {
+                "ok": True,
+                "dry_run": True,
+                "operation": operation.to_summary(),
+                "rendered_path": rendered_path,
+                "query_params": query_params,
+                "body": body,
+                "reason": reason,
+            }
+        )
 
     logger.info("Calling Cannanas operation %s", operation_id)
-    return await _make_client(settings).call_operation(
+    result = await _make_client(settings).call_operation(
         operation=operation,
         rendered_path=rendered_path,
         query_params=query_params,
         body=body,
         reason=reason,
+    )
+    return _sanitize_response(result)
+
+
+@mcp.tool
+async def diagnose_reporting_sources(
+    club_id: str,
+    start_date: str,
+    end_date: str,
+    page_size: int | None = None,
+    max_records_per_source: int = 200,
+) -> dict[str, Any]:
+    """Diagnose which Cannanas sources contain reporting data for a period without returning raw records."""
+    settings = get_settings()
+    if not settings.api_key:
+        return _missing_api_key_error()
+
+    period_start, period_end = resolve_period_window(start_date, end_date, default_days=7)
+    max_records = max(1, min(max_records_per_source, 500))
+
+    source_results: dict[str, dict[str, Any]] = {}
+    source_specs: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = [
+        (
+            "getClubCharges",
+            {"clubId": club_id},
+            {"created_at_start": period_start, "created_at_end": period_end, "archived": False},
+        ),
+        (
+            "getClubCarts",
+            {"clubId": club_id},
+            {"created_at_start": period_start, "created_at_end": period_end, "archived": False},
+        ),
+        (
+            "getClubProducts",
+            {"clubId": club_id},
+            {},
+        ),
+        (
+            "getClubStrains",
+            {"clubId": club_id},
+            {"archived": False},
+        ),
+        (
+            "getClubMemberJournals",
+            {"clubId": club_id},
+            {"created_at_start": period_start, "created_at_end": period_end, "archived": False},
+        ),
+    ]
+
+    for operation_id, path_params, query_params in source_specs:
+        source_results[operation_id] = await _call_paginated(
+            settings=settings,
+            operation_id=operation_id,
+            path_params=path_params,
+            query_params=query_params,
+            reason="Diagnose reporting data availability and field shapes.",
+            page_size=page_size,
+            max_records=max_records,
+            sanitize=False,
+        )
+
+    diagnostics = build_reporting_source_diagnostics(
+        period_start=period_start,
+        period_end=period_end,
+        source_results=source_results,
+    )
+    return _sanitize_response(diagnostics)
+
+
+@mcp.tool
+async def get_data_quality_report(
+    club_id: str,
+    start_date: str,
+    end_date: str,
+    page_size: int | None = None,
+    max_records_per_source: int = 200,
+) -> dict[str, Any]:
+    """Return safe reporting data-quality checks for a club and date range."""
+    diagnostics = await diagnose_reporting_sources(
+        club_id=club_id,
+        start_date=start_date,
+        end_date=end_date,
+        page_size=page_size,
+        max_records_per_source=max_records_per_source,
+    )
+    if not diagnostics.get("period_start"):
+        return diagnostics
+    return build_data_quality_report(
+        period_start=diagnostics["period_start"],
+        period_end=diagnostics["period_end"],
+        diagnostics=diagnostics,
     )
 
 
@@ -301,12 +413,13 @@ async def get_revenue_summary(
         },
         reason="Build a normalized revenue summary for reporting.",
         page_size=page_size,
+        sanitize=False,
     )
     if not response.get("ok"):
-        return response
+        return _sanitize_response(response)
     result = build_revenue_summary(response["items"], period_start=period_start, period_end=period_end)
     result["pagination"] = response["pagination"]
-    return result
+    return _sanitize_response(result)
 
 
 @mcp.tool
@@ -334,12 +447,13 @@ async def get_dispensed_amounts(
         },
         reason="Aggregate dispensed quantities from fulfilled carts.",
         page_size=page_size,
+        sanitize=False,
     )
     if not response.get("ok"):
-        return response
+        return _sanitize_response(response)
     result = build_dispensed_amounts(response["items"], period_start=period_start, period_end=period_end)
     result["pagination"] = response["pagination"]
-    return result
+    return _sanitize_response(result)
 
 
 @mcp.tool
@@ -367,9 +481,10 @@ async def get_strain_performance(
         },
         reason="Analyze fulfilled carts for strain performance.",
         page_size=page_size,
+        sanitize=False,
     )
     if not carts_response.get("ok"):
-        return carts_response
+        return _sanitize_response(carts_response)
     products_response = await _call_paginated(
         settings=settings,
         operation_id="getClubProducts",
@@ -377,9 +492,10 @@ async def get_strain_performance(
         query_params={},
         reason="Enrich strain performance with the product catalog.",
         page_size=page_size,
+        sanitize=False,
     )
     if not products_response.get("ok"):
-        return products_response
+        return _sanitize_response(products_response)
     strains_response = await _call_paginated(
         settings=settings,
         operation_id="getClubStrains",
@@ -387,9 +503,10 @@ async def get_strain_performance(
         query_params={"archived": False},
         reason="Enrich strain performance with strain metadata.",
         page_size=page_size,
+        sanitize=False,
     )
     if not strains_response.get("ok"):
-        return strains_response
+        return _sanitize_response(strains_response)
     result = build_strain_performance(
         carts_response["items"],
         products_response["items"],
@@ -402,7 +519,7 @@ async def get_strain_performance(
         "products": products_response["pagination"],
         "strains": strains_response["pagination"],
     }
-    return result
+    return _sanitize_response(result)
 
 
 @mcp.tool
@@ -430,9 +547,10 @@ async def get_category_breakdown(
         },
         reason="Aggregate fulfilled cart items by category.",
         page_size=page_size,
+        sanitize=False,
     )
     if not carts_response.get("ok"):
-        return carts_response
+        return _sanitize_response(carts_response)
     products_response = await _call_paginated(
         settings=settings,
         operation_id="getClubProducts",
@@ -440,9 +558,10 @@ async def get_category_breakdown(
         query_params={},
         reason="Enrich category breakdown with the product catalog.",
         page_size=page_size,
+        sanitize=False,
     )
     if not products_response.get("ok"):
-        return products_response
+        return _sanitize_response(products_response)
     result = build_category_breakdown(
         carts_response["items"],
         products_response["items"],
@@ -453,7 +572,7 @@ async def get_category_breakdown(
         "carts": carts_response["pagination"],
         "products": products_response["pagination"],
     }
-    return result
+    return _sanitize_response(result)
 
 
 @mcp.tool
@@ -514,9 +633,10 @@ async def get_weekly_metrics(
         query_params={},
         body=None,
         reason="Fetch member statistics for weekly metrics.",
+        sanitize=False,
     )
     if not member_statistics_result.get("ok"):
-        return member_statistics_result
+        return _sanitize_response(member_statistics_result)
     member_statistics = member_statistics_result.get("data")
 
     journals_response = await _call_paginated(
@@ -530,9 +650,10 @@ async def get_weekly_metrics(
         },
         reason="Count member journal activity for weekly metrics.",
         page_size=page_size,
+        sanitize=False,
     )
     if not journals_response.get("ok"):
-        return journals_response
+        return _sanitize_response(journals_response)
 
     result = build_weekly_metrics(
         period_start=period_start,
@@ -552,7 +673,7 @@ async def get_weekly_metrics(
         "member_journals": journals_response.get("pagination"),
     }
     result["membership_statistics_summary"] = summarize_member_statistics(member_statistics)
-    return result
+    return _sanitize_response(result)
 
 
 def main() -> None:
