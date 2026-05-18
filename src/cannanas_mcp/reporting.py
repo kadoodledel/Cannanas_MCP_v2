@@ -6,6 +6,63 @@ from typing import Any
 
 from cannanas_mcp.policy import normalize_source_operations
 
+PERSON_ENTITY_KEYS = {
+    "member",
+    "members",
+    "user",
+    "users",
+    "customer",
+    "customers",
+    "patient",
+    "patients",
+    "person",
+    "people",
+    "applicant",
+    "applicants",
+    "contact",
+    "contacts",
+}
+
+SENSITIVE_KEY_FRAGMENTS = {
+    "address",
+    "street",
+    "house_number",
+    "housenumber",
+    "postal",
+    "postcode",
+    "zip",
+    "email",
+    "phone",
+    "mobile",
+    "telephone",
+    "birth",
+    "birthday",
+    "dob",
+    "date_of_birth",
+    "identity",
+    "passport",
+    "id_card",
+    "idcard",
+    "document",
+    "iban",
+    "bic",
+    "bank",
+    "tax_id",
+    "taxid",
+    "social_security",
+    "ssn",
+    "health",
+    "diagnosis",
+    "prescription",
+    "medical",
+    "journal",
+    "note",
+    "comment",
+}
+
+PERSON_NAME_KEYS = {"name", "first_name", "firstname", "last_name", "lastname", "full_name", "fullname"}
+SAFE_NAME_CONTEXTS = {"product", "products", "strain", "strains", "category", "categories", "club", "clubs", "inventory"}
+
 
 def resolve_period_window(start_date: str | None, end_date: str | None, *, default_days: int = 7) -> tuple[str, str]:
     if end_date is None:
@@ -266,6 +323,164 @@ def build_weekly_metrics(
     }
 
 
+def build_reporting_source_diagnostics(
+    *,
+    period_start: str,
+    period_end: str,
+    source_results: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    recommendations: list[str] = []
+
+    for operation_id, response in source_results.items():
+        if not response.get("ok"):
+            diagnostics[operation_id] = {
+                "ok": False,
+                "status_code": response.get("status_code"),
+                "error_type": response.get("error_type"),
+                "error": response.get("error"),
+            }
+            continue
+
+        items = response.get("items") or []
+        diagnostics[operation_id] = summarize_items_for_diagnostics(operation_id, items)
+
+    charges = diagnostics.get("getClubCharges", {})
+    carts = diagnostics.get("getClubCarts", {})
+    if charges.get("item_count") == 0 and carts.get("item_count", 0) > 0:
+        recommendations.append(
+            "Club charges are empty while carts exist. Revenue should probably be derived from fulfilled carts, ledger/TSE transactions, or another finance endpoint rather than getClubCharges."
+        )
+    if carts.get("item_count") == 0:
+        recommendations.append("No carts were found for the selected period. Verify club_id, date field semantics, and date range.")
+    if not recommendations:
+        recommendations.append("Use the source with non-zero records and extractable money fields as the first candidate for sales reporting.")
+
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "sources": diagnostics,
+        "recommendations": recommendations,
+        "privacy": {
+            "raw_records_returned": False,
+            "sample_values_redacted": True,
+        },
+        "source_operations": normalize_source_operations(source_results.keys()),
+    }
+
+
+def build_data_quality_report(*, period_start: str, period_end: str, diagnostics: dict[str, Any]) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    sources = diagnostics.get("sources", {})
+
+    charges = sources.get("getClubCharges", {})
+    carts = sources.get("getClubCarts", {})
+    products = sources.get("getClubProducts", {})
+    strains = sources.get("getClubStrains", {})
+
+    if charges.get("ok") is False:
+        issues.append({"severity": "high", "source": "getClubCharges", "issue": "charges_source_error", "detail": charges.get("error")})
+    if carts.get("ok") is False:
+        issues.append({"severity": "high", "source": "getClubCarts", "issue": "carts_source_error", "detail": carts.get("error")})
+
+    if charges.get("item_count") == 0 and carts.get("item_count", 0) > 0:
+        issues.append(
+            {
+                "severity": "high",
+                "source": "getClubCharges/getClubCarts",
+                "issue": "revenue_source_mismatch",
+                "detail": "Charges are empty but carts exist, so charge-based revenue can report zero incorrectly.",
+            }
+        )
+
+    if carts.get("item_count", 0) > 0 and carts.get("items_with_extractable_money", 0) == 0:
+        issues.append(
+            {
+                "severity": "medium",
+                "source": "getClubCarts",
+                "issue": "cart_money_not_extractable",
+                "detail": "Carts exist but no common money fields were detected in sampled records.",
+            }
+        )
+
+    if products.get("item_count") == 0:
+        issues.append({"severity": "medium", "source": "getClubProducts", "issue": "empty_product_catalog"})
+    if strains.get("item_count") == 0:
+        issues.append({"severity": "low", "source": "getClubStrains", "issue": "empty_strain_catalog"})
+
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "issue_count": len(issues),
+        "issues": issues,
+        "notes": [
+            "This report is based on metadata, counts, and safe field-shape diagnostics rather than raw personal records.",
+        ],
+        "source_operations": diagnostics.get("source_operations", []),
+    }
+
+
+def summarize_items_for_diagnostics(operation_id: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    field_counts: dict[str, int] = defaultdict(int)
+    date_fields: set[str] = set()
+    status_counts: dict[str, int] = defaultdict(int)
+    money_fields: dict[str, int] = defaultdict(int)
+    quantity_fields: dict[str, int] = defaultdict(int)
+    items_with_extractable_money = 0
+    items_with_items_list = 0
+
+    for item in items[:200]:
+        flattened = _flatten_shape(item)
+        for key, value in flattened.items():
+            field_counts[key] += 1
+            key_l = key.lower()
+            if "date" in key_l or key_l.endswith("_at") or key_l in {"createdat", "updatedat"}:
+                date_fields.add(key)
+            if key_l.endswith("status") or key_l == "status":
+                status_counts[str(value)] += 1
+            if any(fragment in key_l for fragment in ("amount", "total", "price", "gross", "net", "paid")):
+                if _coerce_float(value) is not None:
+                    money_fields[key] += 1
+            if any(fragment in key_l for fragment in ("quantity", "weight", "gram", "amount")):
+                if _coerce_float(value) is not None:
+                    quantity_fields[key] += 1
+        if _extract_money_amount(item) is not None:
+            items_with_extractable_money += 1
+        if _extract_cart_items(item):
+            items_with_items_list += 1
+
+    return {
+        "ok": True,
+        "operation_id": operation_id,
+        "item_count": len(items),
+        "sampled_count": min(len(items), 200),
+        "date_fields_seen": sorted(date_fields),
+        "status_counts": dict(sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))[:20]),
+        "candidate_money_fields": dict(sorted(money_fields.items(), key=lambda item: (-item[1], item[0]))[:20]),
+        "candidate_quantity_fields": dict(sorted(quantity_fields.items(), key=lambda item: (-item[1], item[0]))[:20]),
+        "items_with_extractable_money": items_with_extractable_money,
+        "items_with_items_list": items_with_items_list,
+        "top_level_fields": sorted({key.split(".")[0] for key in field_counts})[:80],
+    }
+
+
+def sanitize_for_privacy(data: Any, *, context: tuple[str, ...] = ()) -> Any:
+    if isinstance(data, list):
+        return [sanitize_for_privacy(item, context=context) for item in data]
+    if not isinstance(data, dict):
+        return data
+
+    sanitized: dict[str, Any] = {}
+    for key, value in data.items():
+        key_l = key.lower()
+        next_context = (*context, key_l)
+        if _is_sensitive_key(key_l, context):
+            sanitized[key] = "[REDACTED]"
+        else:
+            sanitized[key] = sanitize_for_privacy(value, context=next_context)
+    return sanitized
+
+
 def summarize_member_statistics(member_statistics: Any) -> dict[str, Any]:
     if isinstance(member_statistics, list):
         return {"raw_list_length": len(member_statistics)}
@@ -312,6 +527,8 @@ def _extract_money_amount(charge: dict[str, Any]) -> float | None:
             "price",
             "summary.total",
             "amounts.total",
+            "total_price",
+            "totalPrice",
         ],
     )
     return _coerce_float(value)
@@ -446,3 +663,31 @@ def _collapse_named_totals(values: dict[str, dict[str, Any]]) -> list[dict[str, 
             }
         )
     return collapsed
+
+
+def _flatten_shape(data: Any, prefix: str = "") -> dict[str, Any]:
+    flattened: dict[str, Any] = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                flattened.update(_flatten_shape(value, path))
+            elif isinstance(value, list):
+                flattened[path] = f"list[{len(value)}]"
+                if value and isinstance(value[0], dict):
+                    flattened.update(_flatten_shape(value[0], f"{path}[]"))
+            else:
+                flattened[path] = value
+    return flattened
+
+
+def _is_sensitive_key(key_l: str, context: tuple[str, ...]) -> bool:
+    if any(fragment in key_l for fragment in SENSITIVE_KEY_FRAGMENTS):
+        return True
+    if key_l in PERSON_NAME_KEYS:
+        if any(part in SAFE_NAME_CONTEXTS for part in context):
+            return False
+        if any(part in PERSON_ENTITY_KEYS for part in context):
+            return True
+        return key_l != "name"
+    return False
