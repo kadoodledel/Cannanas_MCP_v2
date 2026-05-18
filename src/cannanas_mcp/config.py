@@ -36,6 +36,21 @@ def _parse_bool(value: str | None, *, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_transport(value: str | None) -> str:
+    """Return a FastMCP transport name suitable for hosted MCP deployments.
+
+    Alpic validates this project with the streamable HTTP transport. The previous
+    default of stdio is appropriate for local CLI use, but it causes hosted
+    validation to hang because there is no HTTP server to answer the probe.
+    """
+    transport = (value or "streamable-http").strip().lower().replace("_", "-")
+    aliases = {
+        "streamablehttp": "streamable-http",
+        "http": "streamable-http",
+    }
+    return aliases.get(transport, transport)
+
+
 def load_settings() -> Settings:
     openapi_path = Path(os.getenv("CANNANAS_OPENAPI_PATH", str(get_default_openapi_path())))
     if not openapi_path.exists():
@@ -51,7 +66,7 @@ def load_settings() -> Settings:
         api_key=api_key,
         openapi_path=openapi_path,
         timeout_seconds=float(os.getenv("CANNANAS_TIMEOUT_SECONDS", "45")),
-        transport=os.getenv("MCP_TRANSPORT", "stdio"),
+        transport=_normalize_transport(os.getenv("MCP_TRANSPORT")),
         production_mode=production_mode,
         enable_search_operations=_parse_bool(
             os.getenv("CANNANAS_ENABLE_SEARCH_OPERATIONS"),
